@@ -1,5 +1,6 @@
 using UnityEngine;
 using System.Collections;
+using UnityEngine.EventSystems;
 
 [RequireComponent(typeof(Rigidbody), typeof(Animator))]
 public class PlayerTouchMovement : MonoBehaviour
@@ -58,6 +59,10 @@ public class PlayerTouchMovement : MonoBehaviour
         if (Input.touchCount == 0 || isJumping) return;
 
         Touch touch = Input.GetTouch(0);
+
+        // ?? NUEVA LÍNEA: ignora toques sobre elementos UI
+        if (IsPointerOverUI(touch.position)) return;
+
         Ray ray = cameraManager.ActiveCamera.ScreenPointToRay(touch.position);
 
         if (Physics.Raycast(ray, out RaycastHit hit, 100f, groundMask | climbableMask))
@@ -184,5 +189,21 @@ public class PlayerTouchMovement : MonoBehaviour
     private void UpdateAnimator()
     {
         animator.SetFloat("Speed", currentSpeed);
+    }
+
+    private bool IsPointerOverUI(Vector2 screenPosition)
+    {
+        if (EventSystem.current == null)
+            return false;
+
+        PointerEventData eventData = new PointerEventData(EventSystem.current)
+        {
+            position = screenPosition
+        };
+
+        var results = new System.Collections.Generic.List<RaycastResult>();
+        EventSystem.current.RaycastAll(eventData, results);
+
+        return results.Count > 0;
     }
 }
