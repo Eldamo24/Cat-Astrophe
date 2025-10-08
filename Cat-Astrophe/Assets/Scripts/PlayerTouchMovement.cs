@@ -1,10 +1,15 @@
-using UnityEngine;
 using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
 using UnityEngine.EventSystems;
 
 [RequireComponent(typeof(Rigidbody), typeof(Animator))]
 public class PlayerTouchMovement : MonoBehaviour
 {
+    private const float LevelTolerance = 0.1f;
+    private const float MinDropThreshold = -0.2f;
+    private const float RaycastDistance = 100f;
+
     [Header("Movement")]
     [SerializeField] private float moveSpeed = 4f;
     [SerializeField] private float jumpForce = 5f;
@@ -22,121 +27,174 @@ public class PlayerTouchMovement : MonoBehaviour
     [Header("References")]
     [SerializeField] private CameraManager cameraManager;
 
+    private readonly List<IMovementAction> movementActions = new List<IMovementAction>();
+
     private Rigidbody rb;
     private Animator animator;
 
     private Vector3 targetPosition;
     private bool hasTarget;
     private bool isGrounded = true;
-    private bool isOnClimbable = false;
-    private bool isJumping = false;
-    private bool isFalling = false;
+    private bool isOnClimbable;
+    private MovementState currentState = MovementState.Idle;
 
     private float currentSpeed;
 
-    void Awake()
+    private enum MovementState
     {
-        rb = GetComponent<Rigidbody>();
-        rb.constraints = RigidbodyConstraints.FreezeRotation;
-        rb.interpolation = RigidbodyInterpolation.Interpolate;
-        animator = GetComponent<Animator>();
+        Idle,
+        Moving,
+        Jumping,
+        Falling
     }
 
-    void Update()
+    private void Awake()
     {
-        HandleTouchInput();
+        CacheComponents();
+        ConfigurePhysics();
+        RegisterMovementActions();
+    }
+
+    private void Update()
+    {
+        ProcessTouchInput();
         UpdateAnimator();
     }
 
-    void FixedUpdate()
+    private void FixedUpdate()
     {
         HandleMovement();
         CheckGroundStatus();
     }
 
-    private void HandleTouchInput()
+    private void CacheComponents()
     {
-        if (Input.touchCount == 0 || isJumping) return;
+        rb = GetComponent<Rigidbody>();
+        animator = GetComponent<Animator>();
+    }
+
+    private void ConfigurePhysics()
+    {
+        rb.constraints = RigidbodyConstraints.FreezeRotation;
+        rb.interpolation = RigidbodyInterpolation.Interpolate;
+    }
+
+    private void RegisterMovementActions()
+    {
+        movementActions.Add(new WalkAction(this));
+        movementActions.Add(new ClimbAction(this));
+        movementActions.Add(new DescendAction(this));
+    }
+
+    private void ProcessTouchInput()
+    {
+        if (!CanProcessTouch())
+        {
+            return;
+        }
 
         Touch touch = Input.GetTouch(0);
 
-        // ?? NUEVA LÍNEA: ignora toques sobre elementos UI
-        if (IsPointerOverUI(touch.position)) return;
-
-        Ray ray = cameraManager.ActiveCamera.ScreenPointToRay(touch.position);
-
-        if (Physics.Raycast(ray, out RaycastHit hit, 100f, groundMask | climbableMask))
+        if (IsPointerOverUI(touch.position))
         {
-            float verticalDiff = hit.point.y - transform.position.y;
-            float horizontalDist = Vector3.Distance(new Vector3(transform.position.x, 0, transform.position.z),
-                                                    new Vector3(hit.point.x, 0, hit.point.z));
-
-            // ?? Caso 1: caminar o moverse sobre mismo nivel
-            if (Mathf.Abs(verticalDiff) < 0.1f)
-            {
-                SetTarget(new Vector3(hit.point.x, transform.position.y, hit.point.z), false);
-                return;
-            }
-
-            // ?? Caso 2: subir a un objeto
-            if (verticalDiff > 0.1f && verticalDiff <= maxVerticalClimbHeight && horizontalDist <= maxHorizontalJumpDistance)
-            {
-                StartCoroutine(JumpToTarget(new Vector3(hit.point.x, hit.point.y, hit.point.z)));
-                return;
-            }
-
-            // ?? Caso 3: bajar desde un objeto
-            if (verticalDiff < -0.2f && Mathf.Abs(verticalDiff) <= maxVerticalDropHeight)
-            {
-                StartCoroutine(DescendToGround(new Vector3(hit.point.x, hit.point.y, hit.point.z)));
-                return;
-            }
-
-            // ?? Caso 4: destino demasiado lejos o alto ? ignorar
-            hasTarget = false;
+            return;
         }
+
+        if (!TryGetTouchHit(touch.position, out RaycastHit hit))
+        {
+            ClearTarget();
+            return;
+        }
+
+        foreach (IMovementAction action in movementActions)
+        {
+            if (action.TryExecute(hit))
+            {
+                return;
+            }
+        }
+
+        ClearTarget();
     }
 
-    private void SetTarget(Vector3 pos, bool climb)
+    private bool CanProcessTouch()
     {
-        targetPosition = pos;
-        hasTarget = true;
-        isOnClimbable = climb;
+        return Input.touchCount > 0
+            && currentState != MovementState.Jumping
+            && currentState != MovementState.Falling;
+    }
+
+    private bool TryGetTouchHit(Vector2 touchPosition, out RaycastHit hit)
+    {
+        Ray ray = cameraManager.ActiveCamera.ScreenPointToRay(touchPosition);
+        LayerMask hitMask = groundMask | climbableMask;
+        return Physics.Raycast(ray, out hit, RaycastDistance, hitMask);
     }
 
     private void HandleMovement()
     {
-        if (!hasTarget || isJumping || isFalling) return;
-
-        Vector3 direction = (targetPosition - transform.position);
-        direction.y = 0;
-        float distance = direction.magnitude;
-
-        if (distance > stoppingDistance)
+        if (currentState == MovementState.Jumping || currentState == MovementState.Falling)
         {
-            Vector3 moveDir = direction.normalized * moveSpeed;
-            rb.velocity = new Vector3(moveDir.x, rb.velocity.y, moveDir.z);
+            return;
+        }
 
-            Quaternion lookRot = Quaternion.LookRotation(moveDir.normalized);
-            rb.MoveRotation(Quaternion.Slerp(rb.rotation, lookRot, Time.fixedDeltaTime * 10f));
+        if (!hasTarget)
+        {
+            SetHorizontalVelocity(Vector3.zero);
+            currentState = MovementState.Idle;
+            return;
+        }
+
+        Vector3 direction = targetPosition - transform.position;
+        direction.y = 0f;
+
+        if (direction.magnitude > stoppingDistance)
+        {
+            MoveTowards(direction.normalized * moveSpeed);
+            currentState = MovementState.Moving;
         }
         else
         {
-            rb.velocity = new Vector3(0, rb.velocity.y, 0);
-            hasTarget = false;
+            SetHorizontalVelocity(Vector3.zero);
+            ClearTarget();
+            currentState = MovementState.Idle;
         }
 
-        currentSpeed = new Vector3(rb.velocity.x, 0, rb.velocity.z).magnitude;
+        currentSpeed = new Vector3(rb.velocity.x, 0f, rb.velocity.z).magnitude;
     }
 
-    private IEnumerator JumpToTarget(Vector3 dest)
+    private void MoveTowards(Vector3 desiredVelocity)
     {
-        if (isJumping) yield break;
-        isJumping = true;
-        hasTarget = false;
+        Vector3 velocity = new Vector3(desiredVelocity.x, rb.velocity.y, desiredVelocity.z);
+        rb.velocity = velocity;
 
-        Vector3 direction = (dest - transform.position);
-        direction.y = 0;
+        Vector3 lookDirection = new Vector3(desiredVelocity.x, 0f, desiredVelocity.z);
+        if (lookDirection.sqrMagnitude <= Mathf.Epsilon)
+        {
+            return;
+        }
+
+        Quaternion lookRotation = Quaternion.LookRotation(lookDirection);
+        rb.MoveRotation(Quaternion.Slerp(rb.rotation, lookRotation, Time.fixedDeltaTime * 10f));
+    }
+
+    private void SetHorizontalVelocity(Vector3 velocity)
+    {
+        rb.velocity = new Vector3(velocity.x, rb.velocity.y, velocity.z);
+    }
+
+    private IEnumerator JumpToTarget(Vector3 destination)
+    {
+        if (currentState == MovementState.Jumping)
+        {
+            yield break;
+        }
+
+        currentState = MovementState.Jumping;
+        ClearTarget();
+
+        Vector3 direction = destination - transform.position;
+        direction.y = 0f;
         direction.Normalize();
 
         rb.velocity = Vector3.zero;
@@ -144,46 +202,50 @@ public class PlayerTouchMovement : MonoBehaviour
 
         yield return new WaitForSeconds(0.5f);
 
-        rb.MovePosition(new Vector3(dest.x, dest.y + 0.05f, dest.z));
+        rb.MovePosition(new Vector3(destination.x, destination.y + 0.05f, destination.z));
         rb.velocity = Vector3.zero;
 
-        isJumping = false;
+        currentState = MovementState.Idle;
         isGrounded = true;
         isOnClimbable = true;
     }
 
-    private IEnumerator DescendToGround(Vector3 dest)
+    private IEnumerator DescendToGround(Vector3 destination)
     {
-        if (isFalling) yield break;
-        isFalling = true;
-        hasTarget = false;
+        if (currentState == MovementState.Falling)
+        {
+            yield break;
+        }
+
+        currentState = MovementState.Falling;
+        ClearTarget();
 
         Vector3 start = transform.position;
-        float t = 0f;
-        float duration = 0.4f;
+        float elapsed = 0f;
+        const float duration = 0.4f;
 
-        while (t < 1f)
+        while (elapsed < 1f)
         {
-            t += Time.deltaTime / duration;
-            transform.position = Vector3.Lerp(start, new Vector3(dest.x, dest.y + 0.05f, dest.z), t);
+            elapsed += Time.deltaTime / duration;
+            transform.position = Vector3.Lerp(start, new Vector3(destination.x, destination.y + 0.05f, destination.z), elapsed);
             yield return null;
         }
 
+        currentState = MovementState.Idle;
         isGrounded = true;
-        isFalling = false;
         isOnClimbable = false;
     }
 
     private void CheckGroundStatus()
     {
-        if (Physics.Raycast(transform.position + Vector3.up * 0.1f, Vector3.down, out RaycastHit hit, 0.3f, groundMask | climbableMask))
+        Vector3 origin = transform.position + Vector3.up * 0.1f;
+        if (Physics.Raycast(origin, Vector3.down, out _, 0.3f, groundMask | climbableMask))
         {
             isGrounded = true;
+            return;
         }
-        else
-        {
-            isGrounded = false;
-        }
+
+        isGrounded = false;
     }
 
     private void UpdateAnimator()
@@ -191,19 +253,126 @@ public class PlayerTouchMovement : MonoBehaviour
         animator.SetFloat("Speed", currentSpeed);
     }
 
+    private void ClearTarget()
+    {
+        hasTarget = false;
+        isOnClimbable = false;
+    }
+
+    private void SetTarget(Vector3 position, bool onClimbable)
+    {
+        targetPosition = position;
+        hasTarget = true;
+        isOnClimbable = onClimbable;
+    }
+
     private bool IsPointerOverUI(Vector2 screenPosition)
     {
         if (EventSystem.current == null)
+        {
             return false;
+        }
 
         PointerEventData eventData = new PointerEventData(EventSystem.current)
         {
             position = screenPosition
         };
 
-        var results = new System.Collections.Generic.List<RaycastResult>();
+        var results = new List<RaycastResult>();
         EventSystem.current.RaycastAll(eventData, results);
 
         return results.Count > 0;
+    }
+
+    private interface IMovementAction
+    {
+        bool TryExecute(RaycastHit hit);
+    }
+
+    private sealed class WalkAction : IMovementAction
+    {
+        private readonly PlayerTouchMovement controller;
+
+        public WalkAction(PlayerTouchMovement controller)
+        {
+            this.controller = controller;
+        }
+
+        public bool TryExecute(RaycastHit hit)
+        {
+            float verticalDiff = hit.point.y - controller.transform.position.y;
+
+            if (Mathf.Abs(verticalDiff) >= LevelTolerance)
+            {
+                return false;
+            }
+
+            Vector3 position = hit.point;
+            position.y = controller.transform.position.y;
+            controller.SetTarget(position, false);
+            return true;
+        }
+    }
+
+    private sealed class ClimbAction : IMovementAction
+    {
+        private readonly PlayerTouchMovement controller;
+
+        public ClimbAction(PlayerTouchMovement controller)
+        {
+            this.controller = controller;
+        }
+
+        public bool TryExecute(RaycastHit hit)
+        {
+            float verticalDiff = hit.point.y - controller.transform.position.y;
+            if (!IsValidJump(verticalDiff, hit.point, controller.transform.position))
+            {
+                return false;
+            }
+
+            controller.StartCoroutine(controller.JumpToTarget(hit.point));
+            return true;
+        }
+
+        private bool IsValidJump(float verticalDiff, Vector3 target, Vector3 origin)
+        {
+            if (verticalDiff <= LevelTolerance || verticalDiff > controller.maxVerticalClimbHeight)
+            {
+                return false;
+            }
+
+            float horizontalDistance = Vector3.Distance(new Vector3(origin.x, 0f, origin.z), new Vector3(target.x, 0f, target.z));
+            return horizontalDistance <= controller.maxHorizontalJumpDistance;
+        }
+    }
+
+    private sealed class DescendAction : IMovementAction
+    {
+        private readonly PlayerTouchMovement controller;
+
+        public DescendAction(PlayerTouchMovement controller)
+        {
+            this.controller = controller;
+        }
+
+        public bool TryExecute(RaycastHit hit)
+        {
+            float verticalDiff = hit.point.y - controller.transform.position.y;
+
+            if (!IsValidDrop(verticalDiff))
+            {
+                return false;
+            }
+
+            controller.StartCoroutine(controller.DescendToGround(hit.point));
+            return true;
+        }
+
+        private bool IsValidDrop(float verticalDiff)
+        {
+            float dropHeight = Mathf.Abs(verticalDiff);
+            return verticalDiff < MinDropThreshold && dropHeight <= controller.maxVerticalDropHeight;
+        }
     }
 }
